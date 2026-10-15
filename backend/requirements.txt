@@ -1,0 +1,12 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+paho-mqtt==2.1.0
+pydantic==2.9.2
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.5.2
+joblib==1.4.2
+python-multipart==0.0.9
+# Optional — only needed if you upload a TCN (.pt) model.
+# Comment out if you only plan to run the Random Forest / rule model.
+torch==2.4.1

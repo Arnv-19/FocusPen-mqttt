@@ -1,0 +1,35 @@
+:root {
+  --ink: #0D1420;
+  --panel: #141D2B;
+  --panel-raised: #1B2636;
+  --line: #273347;
+  --text: #E7EDF3;
+  --mute: #8291A3;
+  --teal: #16B8A6;
+  --teal-dim: #0E7A6F;
+  --amber: #E09A3E;
+  --amber-dim: #9C6B23;
+  --red: #E05C5C;
+  --viol: #9B7FD4;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  background: var(--ink);
+  color: var(--text);
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.mono { font-family: "JetBrains Mono", "SF Mono", Consolas, monospace; }
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
