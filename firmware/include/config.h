@@ -12,19 +12,19 @@
 #define DEVICE_ID "pen01"
 
 // ---------- WiFi ----------
-#define WIFI_SSID     "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID     "VIT-HOS2-4"
+#define WIFI_PASSWORD "12345678"
 
 // ---------- MQTT broker ----------
-#define MQTT_HOST "192.168.1.50"   // your PC's LAN IP running Mosquitto
+#define MQTT_HOST "10.57.231.71"   // your PC's LAN IP running Mosquitto
 #define MQTT_PORT 1883
 // Leave blank ("") if your broker allows anonymous connections.
-#define MQTT_USER "pen01"
-#define MQTT_PASS "pen01_devicepass"
+#define MQTT_USER ""
+#define MQTT_PASS ""
 
 // ---------- pins (raw GPIO numbers — see wiring notes in README) ----------
 #define PIN_SDA        5   // D4
-#define PIN_SCL        6   // D5
+#define PIN_SCL        4   // D5
 #define PIN_FSR        1   // D0  (ADC)
 #define PIN_LED_STATUS 2   // D1  (onboard-adjacent status LED; optional)
 

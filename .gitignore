@@ -1,0 +1,54 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# PlatformIO & Embedded
+.pio/
+firmware/.pio/
+.pioenvs/
+.piolibdeps/
+.clang_complete
+.gcc-flags.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+backend/.venv/
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+*.egg-info/
+
+# Frontend builds
+frontend/dist/
+frontend/build/
+dist/
+build/
+.cache/
+
+# Databases & local data
+*.db
+*.sqlite3
+backend/data/*.db
+backend/data/sessions.db
+
+# Broker secrets & local configs
+broker/passwordfile
+*.local
+.env
+.env.*
+!.env.example
+
+# IDE & OS
+.vscode/
+firmware/.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

@@ -29,10 +29,10 @@ from . import session as session_store
 
 log = logging.getLogger("mqtt_client")
 
-MQTT_HOST = "localhost"
+MQTT_HOST = "10.57.231.71"
 MQTT_PORT = 1883
-MQTT_USER = "backend"
-MQTT_PASS = "backend_devicepass"
+MQTT_USER = ""
+MQTT_PASS = ""
 
 
 class BackendMQTT:
@@ -57,17 +57,20 @@ class BackendMQTT:
         self.client.disconnect()
 
     # -----------------------------------------------------------
+# -----------------------------------------------------------
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
-        log.info("MQTT connected: %s", reason_code)
+        print(f"\n🔥🔥🔥 BACKEND MQTT CONNECTED! Code: {reason_code}\n")
         client.subscribe("focuspen/+/data", qos=0)
         client.subscribe("focuspen/+/status", qos=1)
         client.subscribe("focuspen/+/inference", qos=0)
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties=None):
-        log.warning("MQTT disconnected: %s (auto-reconnecting)", reason_code)
+        print(f"\n⚠️ BACKEND MQTT DISCONNECTED: {reason_code}\n")
 
     # -----------------------------------------------------------
+    # -----------------------------------------------------------
     def _on_message(self, client, userdata, msg):
+        print(f"📦 Data arrived from broker on topic: {msg.topic}", flush=True)
         try:
             parts = msg.topic.split("/")
             if len(parts) != 3:

@@ -3,19 +3,6 @@ FocusPen backend — FastAPI.
 
 Run:
     uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-
-Everything the dashboard needs is here:
-  WS   /ws                         live raw samples + window results + triggers
-  GET  /api/state                  devices, config, dev_mode, active model
-  PUT  /api/config                 edit sample rate / window / threshold / cooldown
-  POST /api/devmode                {"enabled": true, "password": "..."} — real auth
-  POST /api/trigger                {"device_id": "...", "effect_id": 47} — manual demo button
-  POST /api/models/upload          multipart file + kind=rf|tcn — add a model
-  POST /api/models/select          {"model_id": "..."}
-  POST /api/session/start          {"name": "..."}
-  POST /api/session/stop           {}
-  GET  /api/session/list
-  GET  /api/session/{id}/export    CSV download
 """
 import asyncio
 import os
@@ -38,18 +25,15 @@ from . import session as session_store
 MODELS_DIR = Path(__file__).parent.parent / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
-# Change this before a real demo. Simple on purpose — this is a
-# capstone bench setup, not a production auth system.
 DEV_MODE_PASSWORD = os.environ.get("FOCUSPEN_DEV_PASSWORD", "focuspen-dev")
 
 app = FastAPI(title="FocusPen backend")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten this once it's not running on your own LAN
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 @app.on_event("startup")
 async def startup():
@@ -57,11 +41,9 @@ async def startup():
     ws_manager.bind_loop(loop)
     backend_mqtt.start()
 
-
 @app.on_event("shutdown")
 async def shutdown():
     backend_mqtt.stop()
-
 
 # =========================================================
 #  WebSocket — the live feed
@@ -70,7 +52,6 @@ async def shutdown():
 async def ws_endpoint(ws: WebSocket):
     await ws_manager.connect(ws)
     try:
-        # initial snapshot so a newly-opened dashboard isn't blank
         await ws.send_json({
             "type": "snapshot",
             "devices": state.snapshot_devices(),
@@ -81,10 +62,9 @@ async def ws_endpoint(ws: WebSocket):
             "recording_session_id": state.recording_session_id,
         })
         while True:
-            await ws.receive_text()   # dashboard doesn't need to send anything; keep the socket alive
+            await ws.receive_text()
     except WebSocketDisconnect:
         ws_manager.disconnect(ws)
-
 
 # =========================================================
 #  State / config
@@ -100,7 +80,6 @@ def get_state():
         "recording_session_id": state.recording_session_id,
     }
 
-
 class ConfigUpdate(BaseModel):
     sample_rate_hz: int | None = None
     window_len_s: float | None = None
@@ -111,10 +90,8 @@ class ConfigUpdate(BaseModel):
     cooldown_s: float | None = None
     idle_alert_s: float | None = None
 
-
 @app.put("/api/config")
 def update_config(update: ConfigUpdate):
-    """Dev-mode gated: config changes affect every connected pen."""
     if not state.dev_mode:
         raise HTTPException(403, "dev mode is off — enable it to edit config")
 
@@ -129,21 +106,18 @@ def update_config(update: ConfigUpdate):
         g.reconfigure(c.persistence_n, c.persistence_m, c.confidence_threshold,
                        c.cooldown_s, c.idle_alert_s)
 
-    # push the sample rate out to every known device over MQTT
     for device_id in state.devices:
         backend_mqtt.publish_config(device_id, {"sample_rate": c.sample_rate_hz})
 
     ws_manager.broadcast_threadsafe({"type": "config", **c.as_dict()})
     return c.as_dict()
 
-
 # =========================================================
-#  Dev mode — real server-side gate
+#  Dev mode
 # =========================================================
 class DevModeRequest(BaseModel):
     enabled: bool
     password: str = ""
-
 
 @app.post("/api/devmode")
 def set_dev_mode(req: DevModeRequest):
@@ -156,14 +130,12 @@ def set_dev_mode(req: DevModeRequest):
     ws_manager.broadcast_threadsafe({"type": "dev_mode", "enabled": state.dev_mode})
     return {"dev_mode": state.dev_mode}
 
-
 # =========================================================
-#  Manual / instant trigger — for demos
+#  Manual / instant trigger
 # =========================================================
 class TriggerRequest(BaseModel):
     device_id: str
     effect_id: int
-
 
 @app.post("/api/trigger")
 def manual_trigger(req: TriggerRequest):
@@ -175,7 +147,6 @@ def manual_trigger(req: TriggerRequest):
         "decision": "manual", "label": "manual", "effect_id": req.effect_id,
     })
     return {"ok": True}
-
 
 # =========================================================
 #  Models — switch / upload weights
@@ -192,11 +163,10 @@ def select_model(model_id: str = Form(...)):
     ws_manager.broadcast_threadsafe({"type": "active_model", "model_id": model_id})
     return {"active_model": model_id}
 
-
 @app.post("/api/models/upload")
 async def upload_model(
     file: UploadFile = File(...),
-    kind: str = Form(...),       # "rf" (joblib) or "tcn" (torchscript .pt)
+    kind: str = Form(...),       
     model_id: str = Form(...),
 ):
     if not state.dev_mode:
@@ -204,7 +174,10 @@ async def upload_model(
     if kind not in ("rf", "tcn"):
         raise HTTPException(400, "kind must be 'rf' or 'tcn'")
 
-    dest = MODELS_DIR / f"{model_id}.{'joblib' if kind == 'rf' else 'pt'}"
+    # Save as .onnx if it's a TCN model
+    ext = 'joblib' if kind == 'rf' else 'onnx'
+    dest = MODELS_DIR / f"{model_id}.{ext}"
+    
     with dest.open("wb") as f:
         shutil.copyfileobj(file.file, f)
 
@@ -220,25 +193,22 @@ async def upload_model(
     })
     return {"model_id": model_id, "kind": kind}
 
-
 # =========================================================
 #  Session recording
 # =========================================================
 class SessionStartRequest(BaseModel):
     name: str = "session"
 
-
 @app.post("/api/session/start")
 def start_session(req: SessionStartRequest):
     if not state.dev_mode:
-        raise HTTPException(403, "dev mode is off — enable it to record sessions")
+        raise HTTPException(403, "dev mode is off")
     if state.recording_session_id is not None:
         raise HTTPException(409, "a session is already recording")
     sid = session_store.start_session(req.name)
     state.recording_session_id = sid
     ws_manager.broadcast_threadsafe({"type": "session_started", "session_id": sid})
     return {"session_id": sid}
-
 
 @app.post("/api/session/stop")
 def stop_session():
@@ -250,11 +220,9 @@ def stop_session():
     ws_manager.broadcast_threadsafe({"type": "session_stopped", "session_id": sid})
     return {"session_id": sid}
 
-
 @app.get("/api/session/list")
 def list_sessions():
     return session_store.list_sessions()
-
 
 @app.get("/api/session/{session_id}/export", response_class=PlainTextResponse)
 def export_session(session_id: int):

@@ -23,6 +23,12 @@ from .features import extract_features
 LABELS = ["writing", "fidgeting", "idle", "gripping"]
 
 
+def _softmax(x: np.ndarray) -> np.ndarray:
+    """Compute softmax values for each set of scores in x."""
+    e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    return e_x / e_x.sum(axis=-1, keepdims=True)
+
+
 # =========================================================
 #  Models
 # =========================================================
@@ -39,9 +45,9 @@ class RuleModel(BaseModel):
     Always available, no training required. Implements the same
     motion x pressure quadrant used to design the behaviour classes:
 
-                     low pressure        high pressure
-      high motion    fidgeting           writing
-      low motion     idle                gripping
+                      low pressure         high pressure
+       high motion    fidgeting            writing
+       low motion     idle                 gripping
 
     This exists so the whole pipeline — windowing, MQTT, dashboard,
     guard layer — is demoable and testable before any model is trained.
@@ -92,24 +98,51 @@ class TCNModel(BaseModel):
     needs_raw_window = True
 
     def __init__(self, model_path: str):
-        import torch
-        self.torch = torch
-        self.model = torch.jit.load(model_path, map_location="cpu")
-        self.model.eval()
+        import onnxruntime as ort
+        self.session = ort.InferenceSession(
+            model_path,
+            providers=["CPUExecutionProvider"]
+        )
+        self.input_node = self.session.get_inputs()[0]
+        self.input_name = self.input_node.name
+        self.input_shape = self.input_node.shape
+
+        # Auto-detect if this model expects 6 features (IMU only) or 7 (IMU + FSR)
+        # Shape is usually (batch, channels, time) or (batch, time, channels)
+        if 6 in self.input_shape:
+            self.expected_features = 6
+        elif 7 in self.input_shape:
+            self.expected_features = 7
+        else:
+            self.expected_features = 6 # Fallback
 
     def predict(self, window: np.ndarray, fs: int) -> Tuple[str, float]:
-        # window: (N, 7) -> model expects (1, 7, N), per-channel z-scored.
-        x = window.astype(np.float32).T  # (7, N)
-        mean = x.mean(axis=1, keepdims=True)
-        std = x.std(axis=1, keepdims=True) + 1e-6
-        x = (x - mean) / std
-        x = x[None, :, :]  # (1, 7, N)
-        with self.torch.no_grad():
-            logits = self.model(self.torch.from_numpy(x))
-            probs = self.torch.softmax(logits, dim=-1).numpy()[0]
+        # Dynamically slice the data based on what the model expects!
+        # If expected_features is 6, it drops the FSR. If 7, it keeps it.
+        raw_data = window[:, :self.expected_features].astype(np.float32) 
+
+        # Standard per-channel z-score normalization across time
+        mean = raw_data.mean(axis=0, keepdims=True)
+        std = raw_data.std(axis=0, keepdims=True) + 1e-6
+        norm_data = (raw_data - mean) / std  
+
+        # Check expected shape formatting (channels-first vs channels-last)
+        if len(self.input_shape) == 3 and self.input_shape[1] == self.expected_features:
+            x = norm_data.T[None, :, :]  # (1, features, N)
+        else:
+            x = norm_data[None, :, :]    # (1, N, features)
+
+        outputs = self.session.run(None, {self.input_name: x})
+        raw_output = np.squeeze(outputs[0]) 
+
+        # Convert to probabilities 
+        if np.all(raw_output >= 0.0) and np.isclose(np.sum(raw_output), 1.0, atol=1e-2):
+            probs = raw_output
+        else:
+            probs = _softmax(raw_output)
+
         idx = int(np.argmax(probs))
         return LABELS[idx], float(probs[idx])
-
 
 class ModelRegistry:
     def __init__(self):
@@ -163,7 +196,7 @@ class GuardLayer:
         self.last_fire_ts = 0.0
 
     def reconfigure(self, persistence_n, persistence_m, confidence_threshold,
-                     cooldown_s, idle_alert_s):
+                    cooldown_s, idle_alert_s):
         self.n = persistence_n
         self.cooldown_s = cooldown_s
         self.conf_th = confidence_threshold
@@ -182,10 +215,6 @@ class GuardLayer:
         now = time.time()
 
         if confidence < self.conf_th:
-            # Below confidence: don't let this window count toward
-            # anything, but still track idle timing on label trend if
-            # it was a strong idle reading previously — simplest and
-            # safest is to just not push an unreliable window.
             return {
                 "label": label, "confidence": confidence, "counted": False,
                 "restless_count": self._restless_count(), "m": self.m,

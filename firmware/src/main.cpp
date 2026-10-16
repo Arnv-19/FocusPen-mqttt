@@ -1,41 +1,22 @@
-/* =========================================================
-   FocusPen firmware — Seeed XIAO ESP32-S3
-   PlatformIO project. See include/config.h for all settings.
-
-   Design goal: sampling must never stop because the network is
-   unhappy. WiFi and MQTT both reconnect through non-blocking state
-   machines — nothing in loop() ever calls delay(). If the broker is
-   unreachable, samples queue locally (bounded) rather than blocking
-   or being silently discarded one-by-one.
-
-   Topics (see config.h):
-     publishes -> focuspen/<id>/data        batched raw samples
-     publishes -> focuspen/<id>/status       "online"/"offline" (+ LWT)
-     subscribes-> focuspen/<id>/haptic       effect id to play
-     subscribes-> focuspen/<id>/config       {"sample_rate": N}
-   ========================================================= */
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 #include <Adafruit_DRV2605.h>
 #include "config.h"
+
+#define DRV_EN_PIN 18   // Haptic driver enable pin
 
 // =========================================================
 //  Globals
 // =========================================================
 WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
-
-Adafruit_MPU6050 mpu;
 Adafruit_DRV2605 drv;
 
 bool sensorsReady = false;   // MPU6050 initialised
-bool hapticReady   = false;  // DRV2605 initialised — pen still streams without it
+bool hapticReady   = false;  // DRV2605 initialised
 
 // ---------- sampling ----------
 uint32_t sampleRateHz   = DEFAULT_SAMPLE_RATE_HZ;
@@ -46,12 +27,10 @@ struct Sample {
   float ax, ay, az, gx, gy, gz, p;
 };
 
-// one in-progress batch
 Sample   currentBatch[SAMPLES_PER_BATCH];
 uint16_t currentBatchCount = 0;
 uint32_t currentBatchStartMs = 0;
 
-// bounded queue of completed batches awaiting publish
 struct QueuedBatch {
   Sample   samples[SAMPLES_PER_BATCH];
   uint16_t count;
@@ -59,34 +38,113 @@ struct QueuedBatch {
   bool     used;
 };
 QueuedBatch batchQueue[MAX_BATCH_QUEUE];
-uint8_t queueHead = 0;   // next to publish
-uint8_t queueTail = 0;   // next free slot
+uint8_t queueHead = 0;
+uint8_t queueTail = 0;
 uint8_t queueCount = 0;
 
-// ---------- WiFi state machine ----------
 uint32_t lastWifiAttemptMs = 0;
 bool wifiWasConnected = false;
 
-// ---------- MQTT state machine ----------
 uint32_t lastMqttAttemptMs = 0;
 bool mqttWasConnected = false;
-
-// ---------- heartbeat ----------
 uint32_t lastHeartbeatMs = 0;
-
-// ---------- sensor retry ----------
 uint32_t lastSensorRetryMs = 0;
 
 // =========================================================
-//  Queue helpers (never blocks; drops oldest when full)
+//  RAW MPU6050 I2C FUNCTIONS (From your working script)
+// =========================================================
+uint8_t MPU_ADDR = 0x68;
+
+bool writeRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool readRegisters(uint8_t reg, uint8_t count, uint8_t *buffer) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  
+  size_t received = Wire.requestFrom((uint16_t)MPU_ADDR, (uint8_t)count, (uint8_t)true);
+  if (received != count) {
+    while (Wire.available()) Wire.read();
+    return false;
+  }
+  
+  for (uint8_t i = 0; i < count; i++) {
+    buffer[i] = Wire.read();
+  }
+  return true;
+}
+
+int16_t readInt16(uint8_t highByte, uint8_t lowByte) {
+  return (int16_t)(((uint16_t)highByte << 8) | lowByte);
+}
+
+bool detectMPU6050() {
+  const uint8_t addresses[] = {0x68, 0x69};
+  for (uint8_t i = 0; i < 2; i++) {
+    Wire.beginTransmission(addresses[i]);
+    if (Wire.endTransmission() == 0) {
+      MPU_ADDR = addresses[i];
+      return true;
+    }
+  }
+  return false;
+}
+
+bool initializeMPU6050() {
+  if (!detectMPU6050()) return false;
+  
+  uint8_t identity = 0;
+  if (!readRegisters(0x75, 1, &identity)) return false; // WHO_AM_I
+  
+  if (!writeRegister(0x6B, 0x00)) return false; // Wake up
+  delay(100);
+  if (!writeRegister(0x1C, 0x00)) return false; // Accel: +/- 2g
+  if (!writeRegister(0x1B, 0x00)) return false; // Gyro: +/- 250 dps
+  if (!writeRegister(0x1A, 0x03)) return false; // Digital low-pass filter
+  
+  return true;
+}
+
+bool readSample(Sample &s) {
+  if (!sensorsReady) return false;
+  
+  uint8_t data[14];
+  if (!readRegisters(0x3B, 14, data)) return false;
+  
+  int16_t rawAx = readInt16(data[0], data[1]);
+  int16_t rawAy = readInt16(data[2], data[3]);
+  int16_t rawAz = readInt16(data[4], data[5]);
+  
+  int16_t rawGx = readInt16(data[8], data[9]);
+  int16_t rawGy = readInt16(data[10], data[11]);
+  int16_t rawGz = readInt16(data[12], data[13]);
+  
+  s.ax = rawAx / 16384.0f;
+  s.ay = rawAy / 16384.0f;
+  s.az = rawAz / 16384.0f;
+  
+  s.gx = rawGx / 131.0f;
+  s.gy = rawGy / 131.0f;
+  s.gz = rawGz / 131.0f;
+  
+  int raw = analogRead(PIN_FSR);
+  s.p = constrain(raw / 4095.0f, 0.0f, 1.0f);
+  return true;
+}
+
+// =========================================================
+//  Queue helpers
 // =========================================================
 void enqueueBatch(Sample *samples, uint16_t count, uint32_t startMs) {
   if (queueCount >= MAX_BATCH_QUEUE) {
-    // queue full: drop the oldest to make room. This only happens
-    // during an extended disconnect — see README "known limitations".
     queueHead = (queueHead + 1) % MAX_BATCH_QUEUE;
     queueCount--;
-    Serial.println("[queue] full — dropped oldest batch");
+    Serial.println("[queue] full dropped oldest batch");
   }
   QueuedBatch &slot = batchQueue[queueTail];
   memcpy(slot.samples, samples, sizeof(Sample) * count);
@@ -111,7 +169,7 @@ void dequeuePop() {
 }
 
 // =========================================================
-//  WiFi — non-blocking connect/reconnect
+//  WiFi & MQTT
 // =========================================================
 void maintainWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
@@ -122,39 +180,26 @@ void maintainWiFi() {
     }
     return;
   }
-
   wifiWasConnected = false;
   uint32_t now = millis();
   if (now - lastWifiAttemptMs < WIFI_RETRY_INTERVAL_MS) return;
   lastWifiAttemptMs = now;
-
   Serial.println("[wifi] (re)connecting...");
   WiFi.disconnect();
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  // Non-blocking: we don't wait here. maintainWiFi() is called every
-  // loop() and will notice once status() flips to WL_CONNECTED.
 }
 
-// =========================================================
-//  Haptic + config message handling
-// =========================================================
 void playHapticEffect(uint8_t effectId) {
-  if (!hapticReady) {
-    Serial.println("[haptic] requested but driver not ready — ignored");
-    return;
-  }
+  if (!hapticReady) return;
   drv.setWaveform(0, effectId);
   drv.setWaveform(1, 0);
-  drv.go();   // non-blocking: the DRV2605 plays the effect autonomously
+  drv.go();
   Serial.printf("[haptic] playing effect #%u\n", effectId);
 }
 
 void applySampleRate(uint32_t hz) {
-  if (hz < 10 || hz > 400) {
-    Serial.println("[config] sample_rate out of accepted range (10-400), ignored");
-    return;
-  }
+  if (hz < 10 || hz > 400) return;
   sampleRateHz = hz;
   sampleIntervalUs = 1000000UL / hz;
   Serial.printf("[config] sample rate set to %lu Hz\n", hz);
@@ -165,41 +210,29 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
   unsigned int n = min(length, (unsigned int)sizeof(buf) - 1);
   memcpy(buf, payload, n);
   buf[n] = '\0';
-
   String t(topic);
-
+  
   if (t == TOPIC_HAPTIC) {
     uint8_t effectId = (uint8_t)atoi(buf);
     playHapticEffect(effectId);
     return;
   }
-
   if (t == TOPIC_CONFIG) {
-    StaticJsonDocument<256> doc;
+    JsonDocument doc;
     DeserializationError err = deserializeJson(doc, buf);
-    if (err) {
-      Serial.print("[config] bad JSON: ");
-      Serial.println(err.c_str());
-      return;
-    }
-    if (doc.containsKey("sample_rate")) {
+    if (!err && doc["sample_rate"].is<uint32_t>()) {
       applySampleRate(doc["sample_rate"].as<uint32_t>());
     }
-    return;
   }
 }
 
-// =========================================================
-//  MQTT — non-blocking connect/reconnect, with LWT
-// =========================================================
 void publishStatus(const char *state, bool retained) {
   if (!mqtt.connected()) return;
   mqtt.publish(TOPIC_STATUS, state, retained);
 }
 
 void maintainMQTT() {
-  if (WiFi.status() != WL_CONNECTED) return;   // nothing to do without WiFi
-
+  if (WiFi.status() != WL_CONNECTED) return;
   if (mqtt.connected()) {
     if (!mqttWasConnected) {
       Serial.println("[mqtt] connected");
@@ -210,99 +243,68 @@ void maintainMQTT() {
     }
     return;
   }
-
   mqttWasConnected = false;
   uint32_t now = millis();
   if (now - lastMqttAttemptMs < MQTT_RETRY_INTERVAL_MS) return;
   lastMqttAttemptMs = now;
-
   Serial.println("[mqtt] (re)connecting...");
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setKeepAlive(MQTT_KEEPALIVE_SEC);
   mqtt.setCallback(mqttCallback);
-  mqtt.setBufferSize(2048);   // batched JSON payloads need more than the 256B default
-
+  mqtt.setBufferSize(2048);
+  
   bool ok;
   const char *clientId = DEVICE_ID;
   if (strlen(MQTT_USER) > 0) {
-    ok = mqtt.connect(clientId, MQTT_USER, MQTT_PASS,
-                       TOPIC_STATUS, 1, true, "offline");
+    ok = mqtt.connect(clientId, MQTT_USER, MQTT_PASS, TOPIC_STATUS, 1, true, "offline");
   } else {
     ok = mqtt.connect(clientId, TOPIC_STATUS, 1, true, "offline");
   }
-
-  if (!ok) {
-    Serial.printf("[mqtt] connect failed, rc=%d\n", mqtt.state());
-  }
+  if (!ok) Serial.printf("[mqtt] connect failed, rc=%d\n", mqtt.state());
 }
 
 // =========================================================
-//  Sensors
+//  Sensors Init
 // =========================================================
 void initSensors() {
-  Wire.begin(PIN_SDA, PIN_SCL);
-
   if (!sensorsReady) {
-    if (mpu.begin()) {
-      mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-      mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-      mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    if (initializeMPU6050()) {
       sensorsReady = true;
       Serial.println("[sensors] MPU6050 ready");
     } else {
-      Serial.println("[sensors] MPU6050 not found — will retry");
+      Serial.println("[sensors] MPU6050 not found");
     }
   }
-
+  
   if (!hapticReady) {
-    if (drv.begin()) {
+    if (drv.begin(&Wire)) {
       drv.selectLibrary(1);
       drv.setMode(DRV2605_MODE_INTTRIG);
       hapticReady = true;
       Serial.println("[haptic] DRV2605 ready");
     } else {
-      Serial.println("[haptic] DRV2605 not found — pen will stream without haptics");
+      Serial.println("[haptic] DRV2605 not found");
     }
   }
 }
 
-bool readSample(Sample &s) {
-  if (!sensorsReady) return false;
-
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-
-  s.ax = a.acceleration.x;
-  s.ay = a.acceleration.y;
-  s.az = a.acceleration.z;
-  s.gx = g.gyro.x * 57.2958f;  // rad/s -> deg/s
-  s.gy = g.gyro.y * 57.2958f;
-  s.gz = g.gyro.z * 57.2958f;
-
-  int raw = analogRead(PIN_FSR);          // 0..4095 on the XIAO's 12-bit ADC
-  s.p = constrain(raw / 4095.0f, 0.0f, 1.0f);
-
-  return true;
-}
-
 // =========================================================
-//  Publishing — drains the queue when MQTT is up
+//  Publishing & Sampling
 // =========================================================
 void publishQueuedBatches() {
   if (!mqtt.connected()) return;
-
   QueuedBatch *b;
-  // publish at most one batch per loop() to keep mqtt.loop() responsive
   if (!dequeuePeek(&b)) return;
-
-  StaticJsonDocument<3072> doc;
+  
+  JsonDocument doc;
   doc["device_id"] = DEVICE_ID;
   doc["batch_start_ms"] = b->startMs;
   doc["n"] = b->count;
   doc["fs"] = sampleRateHz;
-  JsonArray samples = doc.createNestedArray("samples");
+  JsonArray samples = doc["samples"].to<JsonArray>();
+  
   for (uint16_t i = 0; i < b->count; i++) {
-    JsonArray row = samples.createNestedArray();
+    JsonArray row = samples.add<JsonArray>();
     row.add(roundf(b->samples[i].ax * 1000) / 1000.0);
     row.add(roundf(b->samples[i].ay * 1000) / 1000.0);
     row.add(roundf(b->samples[i].az * 1000) / 1000.0);
@@ -311,32 +313,27 @@ void publishQueuedBatches() {
     row.add(roundf(b->samples[i].gz * 100) / 100.0);
     row.add(roundf(b->samples[i].p * 1000) / 1000.0);
   }
-
+  
   char payload[3072];
   size_t len = serializeJson(doc, payload, sizeof(payload));
-
   if (mqtt.publish(TOPIC_DATA, (const uint8_t *)payload, len, false)) {
     dequeuePop();
   }
-  // on failure, batch stays queued and is retried next loop()
 }
 
-// =========================================================
-//  Sampling — non-blocking timer, fills batch, enqueues when full
-// =========================================================
 void sampleIfDue() {
   uint64_t nowUs = micros();
   if (nowUs < nextSampleAtUs) return;
   nextSampleAtUs = nowUs + sampleIntervalUs;
-
+  
   Sample s;
-  if (!readSample(s)) return;   // sensor not ready yet; skip silently
-
+  if (!readSample(s)) return;
+  
   if (currentBatchCount == 0) {
     currentBatchStartMs = millis();
   }
   currentBatch[currentBatchCount++] = s;
-
+  
   if (currentBatchCount >= SAMPLES_PER_BATCH) {
     enqueueBatch(currentBatch, currentBatchCount, currentBatchStartMs);
     currentBatchCount = 0;
@@ -346,14 +343,26 @@ void sampleIfDue() {
 // =========================================================
 void setup() {
   Serial.begin(115200);
-  delay(300);   // allow USB serial to settle — not on the hot sampling path
+  delay(300);
+  
   pinMode(PIN_LED_STATUS, OUTPUT);
+  pinMode(PIN_FSR, INPUT);  
   analogReadResolution(12);
 
+  // Enable Haptic Driver Power
+  pinMode(DRV_EN_PIN, OUTPUT);
+  digitalWrite(DRV_EN_PIN, HIGH);
+  delay(50);
+  
+  // Start I2C manually ONCE
+  Wire.setPins(PIN_SDA, PIN_SCL);
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(100000); 
+  
   Serial.println("\n==================================");
-  Serial.println(" FocusPen — " DEVICE_ID);
+  Serial.println(" FocusPen   " DEVICE_ID);
   Serial.println("==================================");
-
+  
   initSensors();
   WiFi.mode(WIFI_STA);
 }
@@ -362,7 +371,7 @@ void loop() {
   maintainWiFi();
   maintainMQTT();
   mqtt.loop();
-
+  
   if (!sensorsReady || !hapticReady) {
     uint32_t now = millis();
     if (now - lastSensorRetryMs >= SENSOR_RETRY_INTERVAL_MS) {
@@ -370,15 +379,14 @@ void loop() {
       initSensors();
     }
   }
-
+  
   sampleIfDue();
   publishQueuedBatches();
-
+  
   uint32_t now = millis();
   if (mqtt.connected() && now - lastHeartbeatMs >= STATUS_HEARTBEAT_MS) {
     lastHeartbeatMs = now;
     publishStatus("online", true);
   }
-
   digitalWrite(PIN_LED_STATUS, mqtt.connected() ? HIGH : LOW);
 }
